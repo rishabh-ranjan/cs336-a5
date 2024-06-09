@@ -1,6 +1,7 @@
 import csv
 from pathlib import Path
 import pkg_resources
+import re
 
 from vllm import LLM, SamplingParams
 
@@ -57,3 +58,15 @@ def infer(prompts):
         completions.append(completion)
 
     return completions
+
+
+abcd_pat = re.compile(r"\b([A-D])\b")
+
+
+def parse_mmlu_completion(completion):
+    match = abcd_pat.search(completion)
+    if match:
+        answer = match.group(1)
+    else:
+        answer = None
+    return answer
