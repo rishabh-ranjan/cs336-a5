@@ -9,34 +9,43 @@ from vllm import LLM, SamplingParams
 from . import templates
 
 
-def load_mmlu(data_dir="data"):
-    test_dir = f"{data_dir}/mmlu/test"
-    subject_csv_files = list(Path(test_dir).iterdir())
-    records = []
-    for subject_csv_file in subject_csv_files:
-        subject = Path(subject_csv_file).stem[: -len("_test")]
-        subject = subject.replace("_", " ")
-        with open(subject_csv_file, "r") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                record = {
-                    "subject": subject,
-                    "question": row[0],
-                    "options": row[1:5],
-                    "answer": row[5],
-                }
-                records.append(record)
-    return records
-
-
-def load_gsm8k(data_dir="data"):
-    test_file = f"{data_dir}/gsm8k/test.jsonl"
-    with open(test_file, "r") as f:
+def get_records(eval_, data_dir="data"):
+    if eval_ == "mmlu":
+        test_dir = f"{data_dir}/mmlu/test"
+        subject_csv_files = list(Path(test_dir).iterdir())
         records = []
-        for line in f:
-            record = json.loads(line)
-            records.append(record)
-    return records
+        for subject_csv_file in subject_csv_files:
+            subject = Path(subject_csv_file).stem[: -len("_test")]
+            subject = subject.replace("_", " ")
+            with open(subject_csv_file, "r") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    record = {
+                        "subject": subject,
+                        "question": row[0],
+                        "options": row[1:5],
+                        "answer": row[5],
+                    }
+                    records.append(record)
+        return records
+
+    if eval_ == "gsm8k":
+        test_file = f"{data_dir}/gsm8k/test.jsonl"
+        with open(test_file, "r") as f:
+            records = []
+            for line in f:
+                record = json.loads(line)
+                records.append(record)
+        return records
+
+    if eval_ == "alpaca_eval":
+        file = f"{data_dir}/alpaca_eval/alpaca_eval.jsonl"
+        with open(file, "r") as f:
+            records = []
+            for line in f:
+                record = json.loads(line)
+                records.append(record)
+        return records
 
 
 def get_prompts(eval_, records):
@@ -66,6 +75,20 @@ def get_responses(prompts):
         responses.append(response)
 
     return responses
+
+
+def dump_alpaca_eval_responses(records, responses, out_file):
+    out_records = []
+    for record, response in zip(records, responses):
+        out_record = {
+            "instruction": record["instruction"],
+            "output": response,
+            "generator": "meta-llama/Meta-Llama-3-8B",
+            "dataset": record["dataset"],
+        }
+        out_records.append(out_record)
+    with open(out_file, "w") as f:
+        json.dump(out_records, f, indent=2)
 
 
 MMLU_PAT = re.compile(r"\b([A-D])\b")
