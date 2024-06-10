@@ -5,7 +5,7 @@ import os
 from typing import Any
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from transformers import PreTrainedTokenizerBase
 
 from cs336_alignment import eval_, loader
@@ -61,7 +61,7 @@ def run_iterate_batches(
     Returns:
         Iterable over batches, where each batch has size `batch_size`.
     """
-    raise NotImplementedError
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 
 def run_parse_mmlu_response(
