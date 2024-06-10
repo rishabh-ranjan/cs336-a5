@@ -25,4 +25,5 @@ Answer:""",
     "gsm8k": r"""{question}
 Answer:""",
     "alpaca_eval": r"""{instruction}""",
+    "sst": r"""{prompts_final}""",
 }

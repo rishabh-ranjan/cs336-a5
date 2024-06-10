@@ -47,6 +47,13 @@ def get_records(eval_, data_dir="data"):
                 records.append(record)
         return records
 
+    if eval_ == "sst":
+        file = f"{data_dir}/simple_safety_tests/simple_safety_tests.csv"
+        with open(file, "r") as f:
+            reader = csv.DictReader(f)
+            records = list(reader)
+        return records
+
 
 def get_prompts(eval_, records):
     sys_template = templates.system_prompt
@@ -63,7 +70,7 @@ def get_responses(prompts):
     sampling_params = SamplingParams(
         temperature=0.0,
         top_p=1.0,
-        max_tokens=256,
+        max_tokens=1024,
         stop=["# Query:"],
     )
     llm = LLM(model="meta-llama/Meta-Llama-3-8B")
@@ -77,18 +84,37 @@ def get_responses(prompts):
     return responses
 
 
-def dump_alpaca_eval_responses(records, responses, out_file):
-    out_records = []
-    for record, response in zip(records, responses):
-        out_record = {
-            "instruction": record["instruction"],
-            "output": response,
-            "generator": "meta-llama/Meta-Llama-3-8B",
-            "dataset": record["dataset"],
-        }
-        out_records.append(out_record)
-    with open(out_file, "w") as f:
-        json.dump(out_records, f, indent=2)
+def clean_response(response):
+    if response.endswith("```\n\n"):
+        response = response[:-5]
+    return response
+
+
+def dump_responses(eval_, records, responses, out_file):
+    if eval_ == "alpaca_eval":
+        out_records = []
+        for record, response in zip(records, responses):
+            out_record = {
+                "instruction": record["instruction"],
+                "output": clean_response(response),
+                "generator": "meta-llama/Meta-Llama-3-8B",
+                "dataset": record["dataset"],
+            }
+            out_records.append(out_record)
+        with open(out_file, "w") as f:
+            json.dump(out_records, f, indent=2)
+        return
+
+    if eval_ == "sst":
+        with open(out_file, "w") as f:
+            for record, response in zip(records, responses):
+                out_record = {
+                    "prompts_final": record["prompts_final"],
+                    "output": clean_response(response),
+                }
+                line = json.dumps(out_record)
+                f.write(line + "\n")
+        return
 
 
 MMLU_PAT = re.compile(r"\b([A-D])\b")
