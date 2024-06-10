@@ -29,6 +29,8 @@ def test_packed_sft_dataset():
     assert len(packed_sft_dataset) == len(expected_examples)
 
     for example, expected_example in zip(packed_sft_dataset, expected_examples):
+        if example["input_ids"].tolist() != expected_example["input_ids"]:
+            breakpoint()
         assert example["input_ids"].tolist() == expected_example["input_ids"]
         assert example["labels"].tolist() == expected_example["labels"]
 

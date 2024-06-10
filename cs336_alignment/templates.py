@@ -27,3 +27,11 @@ Answer:""",
     "alpaca_eval": r"""{instruction}""",
     "sst": r"""{prompts_final}""",
 }
+
+alpaca_chat = r"""Below is an instruction that describes a task. Write a response that appropriately completes the request.
+
+### Instruction:
+{prompt}
+
+### Response:
+{response}"""
