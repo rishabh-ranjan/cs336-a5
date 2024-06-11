@@ -1,6 +1,8 @@
 import json
+from pathlib import Path
 import pkg_resources
 import random
+import time
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
@@ -65,6 +67,10 @@ def main(
     wandb_project="sft",
     seed=42,
     grad_clip=1.0,
+    torch_compile=True,
+    amp=False,
+    save_every_n_batches=16_000,
+    out_dir="out/sft",
 ):
     if wandb_project:
         wandb.init(project=wandb_project, config=locals())
@@ -85,6 +91,9 @@ def main(
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     )
+    if torch_compile:
+        torch.set_float32_matmul_precision("medium")
+        model = torch.compile(model)
     model = model.to(device)
 
     wd_params = []
@@ -110,6 +119,20 @@ def main(
         final_div_factor=10,
     )
 
+    def checkpoint():
+        tic = time.time()
+        try:
+            Path(f"{out_dir}/model.pt").rename(f"{out_dir}/old_model.pt")
+            Path(f"{out_dir}/opt.pt").rename(f"{out_dir}/old_opt.pt")
+            Path(f"{out_dir}/lrs.pt").rename(f"{out_dir}/old_lrs.pt")
+        except FileNotFoundError:
+            pass
+        torch.save(model.state_dict(), f"{out_dir}/model.pt")
+        torch.save(opt.state_dict(), f"{out_dir}/opt.pt")
+        torch.save(lrs.state_dict(), f"{out_dir}/lrs.pt")
+        toc = time.time()
+        print(f"checkpointing took {toc - tic:.3f} s")
+
     for batch_idx in tqdm(range(num_batches)):
         begin_idx = batch_idx * num_batch_tokens
         end_idx = (batch_idx + 1) * num_batch_tokens
@@ -117,7 +140,8 @@ def main(
         labels = data[begin_idx + 1 : end_idx + 1].view(batch_size, ctx_len)
 
         logits = model(inputs).logits
-        loss = F.cross_entropy(logits.transpose(1, 2), labels)
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=amp):
+            loss = F.cross_entropy(logits.transpose(1, 2), labels)
         loss.backward()
 
         if (batch_idx + 1) % grad_acc_steps == 0:
@@ -135,3 +159,8 @@ def main(
             opt.step()
             lrs.step()
             opt.zero_grad(set_to_none=True)
+
+        if (batch_idx + 1) % save_every_n_batches == 0:
+            checkpoint()
+
+    checkpoint()
