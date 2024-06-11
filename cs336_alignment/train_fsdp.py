@@ -9,8 +9,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 from torch import nn, optim
 from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 import wandb
@@ -55,7 +55,7 @@ def main(
     grad_clip=1.0,
     torch_compile=True,
     save_every_n_batches=8_000,
-    out_dir="out/sft_single_gpu",
+    out_dir="out/sft_multi_gpu",
     split="train",
 ):
     torch.backends.cudnn.benchmark = True
@@ -100,7 +100,7 @@ def main(
         model = torch.compile(model)
 
     if is_ddp:
-        model = DDP(model, device_ids=[ddp_local_rank], gradient_as_bucket_view=True)
+        model = FSDP(model, device_id=ddp_local_rank)
 
     wd_params = []
     non_wd_params = []
@@ -140,8 +140,8 @@ def main(
         print(f"checkpointing took {toc - tic:.3f} s")
 
     for batch_idx in tqdm(range(num_batches)):
-        if is_ddp:
-            model.require_backward_grad_sync = (batch_idx + 1) % grad_acc_steps == 0
+        # if is_ddp:
+        #     model.require_backward_grad_sync = (batch_idx + 1) % grad_acc_steps == 0
 
         global_batch_idx = batch_idx * ddp_world_size + ddp_rank
         begin_idx = global_batch_idx * num_batch_tokens
@@ -151,9 +151,10 @@ def main(
         inputs = batch[:-1].view(batch_size, ctx_len)
         labels = batch[1:].view(batch_size, ctx_len)
 
-        logits = model(inputs).logits
-        loss = F.cross_entropy(logits.transpose(1, 2), labels)
-        loss.backward()
+        with model.no_sync():
+            logits = model(inputs).logits
+            loss = F.cross_entropy(logits.transpose(1, 2), labels)
+            loss.backward()
 
         if (batch_idx + 1) % grad_acc_steps == 0:
             if is_master_process:
