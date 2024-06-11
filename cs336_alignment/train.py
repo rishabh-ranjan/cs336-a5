@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import pkg_resources
 import random
@@ -7,7 +8,9 @@ import time
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 from torch import nn, optim
+from torch.distributed import init_process_group, destroy_process_group
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 import wandb
@@ -40,22 +43,6 @@ def tokenize(hf_model, in_file, out_file):
     torch.save(data, out_file)
 
 
-class SFTDataset(Dataset):
-    def __init__(
-        self,
-        data_file,
-        ctx_len,
-    ):
-        self.ctx_len = ctx_len
-        self.data = torch.load(data_file)
-
-    def __len__(self):
-        return (self.data.size(0) - 1) // self.ctx_len
-
-    def __getitem__(self, i):
-        return self.data[i * self.ctx_len : (i + 1) * self.ctx_len + 1]
-
-
 def main(
     *,
     hf_model="meta-llama/Meta-Llama-3-8B",
@@ -65,23 +52,38 @@ def main(
     lr=2e-5,
     weight_decay=0.01,
     wandb_project="sft",
-    seed=42,
     grad_clip=1.0,
     torch_compile=True,
-    amp=False,
     save_every_n_batches=16_000,
     out_dir="out/sft",
+    split="train",
 ):
-    if wandb_project:
-        wandb.init(project=wandb_project, config=locals())
+    torch.backends.cudnn.benchmark = True
 
-    torch.manual_seed(seed)
+    is_ddp = int(os.environ.get("RANK", -1)) != -1
+    if is_ddp:
+        init_process_group(backend="nccl")
+        ddp_rank = int(os.environ["RANK"])
+        ddp_local_rank = int(os.environ["LOCAL_RANK"])
+        ddp_world_size = int(os.environ["WORLD_SIZE"])
+        device = f"cuda:{ddp_local_rank}"
+        is_master_process = ddp_rank == 0
+    else:
+        ddp_rank = 0
+        ddp_world_size = 1
+        device = "cuda"
+        is_master_process = True
 
-    device = "cuda"
+    if is_master_process:
+        if wandb_project:
+            wandb.init(project=wandb_project, config=locals())
 
-    data_file = pkg_resources.resource_filename("cs336_alignment", f"data/sft/train.pt")
-    data = torch.load(data_file).to(device)
-    num_batches = (data.size(0) - 1) // ctx_len
+    data_file = pkg_resources.resource_filename(
+        "cs336_alignment", f"data/sft/{split}.pt"
+    )
+    data = torch.load(data_file)
+    data = data.to(device)
+    num_batches = (data.size(0) - 1) // ctx_len // ddp_world_size
     num_steps = num_batches // grad_acc_steps
     num_batch_tokens = batch_size * ctx_len
 
@@ -91,10 +93,14 @@ def main(
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     )
+    model = model.to(device)
+
     if torch_compile:
         torch.set_float32_matmul_precision("medium")
         model = torch.compile(model)
-    model = model.to(device)
+
+    if is_ddp:
+        model = DDP(model, device_ids=[ddp_local_rank], gradient_as_bucket_view=True)
 
     wd_params = []
     non_wd_params = []
@@ -134,24 +140,30 @@ def main(
         print(f"checkpointing took {toc - tic:.3f} s")
 
     for batch_idx in tqdm(range(num_batches)):
-        begin_idx = batch_idx * num_batch_tokens
-        end_idx = (batch_idx + 1) * num_batch_tokens
-        inputs = data[begin_idx:end_idx].view(batch_size, ctx_len)
-        labels = data[begin_idx + 1 : end_idx + 1].view(batch_size, ctx_len)
+        if is_ddp:
+            model.require_backward_grad_sync = (batch_idx + 1) % grad_acc_steps == 0
+
+        global_batch_idx = batch_idx * ddp_world_size + ddp_rank
+        begin_idx = global_batch_idx * num_batch_tokens
+        end_idx = begin_idx + num_batch_tokens
+        batch = data[begin_idx : end_idx + 1]
+        batch = batch.to(device)
+        inputs = batch[:-1].view(batch_size, ctx_len)
+        labels = batch[1:].view(batch_size, ctx_len)
 
         logits = model(inputs).logits
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=amp):
-            loss = F.cross_entropy(logits.transpose(1, 2), labels)
+        loss = F.cross_entropy(logits.transpose(1, 2), labels)
         loss.backward()
 
         if (batch_idx + 1) % grad_acc_steps == 0:
-            wandb.log(
-                {
-                    "epochs": (batch_idx + 1) / num_batches,
-                    "lr": lrs.get_last_lr()[0],
-                    "loss": loss.item(),
-                }
-            )
+            if is_master_process:
+                wandb.log(
+                    {
+                        "epochs": (batch_idx + 1) / num_batches,
+                        "lr": lrs.get_last_lr()[0],
+                        "loss": loss.item(),
+                    }
+                )
 
             if grad_clip:
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -161,6 +173,11 @@ def main(
             opt.zero_grad(set_to_none=True)
 
         if (batch_idx + 1) % save_every_n_batches == 0:
-            checkpoint()
+            if is_master_process:
+                checkpoint()
 
-    checkpoint()
+    if is_master_process:
+        checkpoint()
+
+    if is_ddp:
+        destroy_process_group()
