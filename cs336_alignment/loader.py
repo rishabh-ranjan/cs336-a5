@@ -26,33 +26,26 @@ def tokenize(hf_model, in_file, out_file):
         tokens = tokenizer(text, add_special_tokens=False).input_ids
         tokens_list.append(tokens)
 
-    torch.save(tokens_list, out_file)
+    random.shuffle(tokens_list)
+    tokens = sum(tokens_list, [])
+    data = torch.tensor(tokens)
+    torch.save(data, out_file)
 
 
 class MySFTDataset(Dataset):
     def __init__(
         self,
-        pt_file,
+        data_file,
         ctx_len,
-        shuffle,
     ):
         self.ctx_len = ctx_len
-
-        tokens_list = torch.load(pt_file)
-
-        if shuffle:
-            random.shuffle(tokens_list)
-
-        self.tokens = []
-        for tokens in tokens_list:
-            self.tokens.extend(tokens)
-        self.tokens = torch.tensor(self.tokens)
+        self.data = torch.load(data_file)
 
     def __len__(self):
-        return (len(self.tokens) - 1) // self.ctx_len
+        return (self.data.size(0) - 1) // self.ctx_len
 
     def __getitem__(self, i):
-        return self.tokens[i * self.ctx_len : (i + 1) * self.ctx_len + 1]
+        return self.data[i * self.ctx_len : (i + 1) * self.ctx_len + 1]
 
 
 class SFTDataset(Dataset):
