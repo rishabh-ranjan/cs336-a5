@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import PreTrainedTokenizerBase
 
-from cs336_alignment import eval_, loader
+from cs336_alignment import eval_, loader, dpo
 
 
 def get_packed_sft_dataset(
@@ -139,4 +139,12 @@ def compute_per_instance_dpo_loss(
     Returns:
         torch.Tensor with the DPO loss for this example.
     """
-    raise NotImplementedError
+    return dpo.dpo_loss(
+        lm,
+        lm_ref,
+        tokenizer,
+        beta,
+        prompt,
+        response_chosen,
+        response_rejected,
+    )
