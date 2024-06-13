@@ -50,8 +50,8 @@ def main(
     *,
     hf_model="meta-llama/Meta-Llama-3-8B",
     ctx_len=512,
-    batch_size=2,
-    grad_acc_steps=2,
+    batch_size=8,
+    grad_acc_steps=1,
     lr=2e-5,
     weight_decay=0.01,
     wandb_project="sft",
@@ -98,11 +98,12 @@ def main(
     # model = model.to(device)
 
     torch.set_float32_matmul_precision("medium")
-    if torch_compile:
-        model = torch.compile(model)
 
     if is_ddp:
         model = FSDP(model, device_id=ddp_local_rank)
+
+    if torch_compile:
+        model = torch.compile(model)
 
     # wd_params = []
     # non_wd_params = []
