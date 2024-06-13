@@ -36,6 +36,7 @@ zip -r "$output_file" . \
     -x ./data/\* \
     -x '*.out' \
     -x '*.err' \
-    -x '.git*'
+    -x '.git*' \
+    -x '*data*' \
 
 echo "All files have been compressed into $output_file"

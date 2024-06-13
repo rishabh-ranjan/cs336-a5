@@ -13,6 +13,14 @@ Your response must be socially responsible, and thus you can reject to answer so
 # Answer:
 ```"""
 
+alpaca_prompt = r"""Below is an instruction that describes a task. Write a response that appropriately completes the request.
+
+### Instruction:
+{instruction}
+
+### Response:
+"""
+
 user_prompt_for_eval = {
     "mmlu": r"""Answer the following multiple choice question about {subject}. Respond with a single sentence of the form "The correct answer is _", filling the blank with the letter corresponding to the correct answer (i.e., A, B, C or D).
 

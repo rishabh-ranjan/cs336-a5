@@ -55,8 +55,11 @@ def get_records(eval_, data_dir="data"):
         return records
 
 
-def get_prompts(eval_, records):
-    sys_template = templates.system_prompt
+def get_prompts(eval_, records, alpaca=False):
+    if alpaca:
+        sys_template = templates.alpaca_prompt
+    else:
+        sys_template = templates.system_prompt
     user_template = templates.user_prompt_for_eval[eval_]
     prompts = []
     for record in records:
@@ -66,14 +69,14 @@ def get_prompts(eval_, records):
     return prompts
 
 
-def get_responses(prompts):
+def get_responses(prompts, hf_model="meta-llama/Meta-Llama-3-8B"):
     sampling_params = SamplingParams(
         temperature=0.0,
         top_p=1.0,
         max_tokens=1024,
         stop=["# Query:"],
     )
-    llm = LLM(model="meta-llama/Meta-Llama-3-8B")
+    llm = LLM(model=hf_model)
     outputs = llm.generate(prompts, sampling_params)
 
     responses = []
