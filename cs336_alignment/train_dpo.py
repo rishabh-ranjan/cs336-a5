@@ -2,6 +2,7 @@ import pkg_resources
 import json
 
 import torch
+from torch import nn, optim
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from vllm import LLM, SamplingParams
@@ -17,17 +18,17 @@ def template(data_dir=DATA_DIR):
     with open(in_file) as in_f:
         records = json.load(in_f)
 
-    for response_type in ["chosen", "rejected"]:
+    for rtype in ["chosen", "rejected"]:
         texts = []
         for record in records:
             prompt = record["prompt"]
-            response = record[response_type]
+            response = record[rtype]
             text = templates.alpaca_chat.format(prompt=prompt, response=response)
             # text = tokenizer.bos_token + text + tokenizer.eos_token
             text = "<|begin_of_text|>" + text + "<|end_of_text|>"
             texts.append(text)
 
-        out_file = f"{data_dir}/{response_type}_templated.json"
+        out_file = f"{data_dir}/{rtype}_templated.json"
         with open(out_file, "w") as out_f:
             json.dump(texts, out_f)
 
@@ -36,8 +37,8 @@ def tokenize(hf_model="meta-llama/Meta-Llama-3-8B", data_dir=DATA_DIR):
     tokenizer = AutoTokenizer.from_pretrained(hf_model)
     tokenizer.pad_token = tokenizer.eos_token
 
-    for response_type in ["chosen", "rejected"]:
-        with open(f"{data_dir}/{response_type}_templated.json") as in_f:
+    for rtype in ["chosen", "rejected"]:
+        with open(f"{data_dir}/{rtype}_templated.json") as in_f:
             texts = json.load(in_f)
 
         encoding = tokenizer(
@@ -53,12 +54,12 @@ def tokenize(hf_model="meta-llama/Meta-Llama-3-8B", data_dir=DATA_DIR):
         input_ids = encoding.input_ids
         attention_mask = encoding.attention_mask
 
-        torch.save(input_ids, f"{data_dir}/input_ids_{response_type}.pt")
-        torch.save(attention_mask, f"{data_dir}/attention_mask_{response_type}.pt")
+        torch.save(input_ids, f"{data_dir}/input_ids_{rtype}.pt")
+        torch.save(attention_mask, f"{data_dir}/attention_mask_{rtype}.pt")
 
 
 def infer(
-    response_type,
+    rtype,
     batch_size=64,
     hf_model="meta-llama/Meta-Llama-3-8B",
     data_dir=DATA_DIR,
@@ -74,11 +75,9 @@ def infer(
     model = torch.compile(model)
     model.eval()
 
-    input_ids = torch.load(
-        f"{data_dir}/input_ids_{response_type}.pt", map_location="cpu"
-    )
+    input_ids = torch.load(f"{data_dir}/input_ids_{rtype}.pt", map_location="cpu")
     attention_mask = torch.load(
-        f"{data_dir}/attention_mask_{response_type}.pt", map_location="cpu"
+        f"{data_dir}/attention_mask_{rtype}.pt", map_location="cpu"
     )
 
     with torch.no_grad():
@@ -98,22 +97,130 @@ def infer(
             lls.append(ll)
         ll = torch.cat(lls)
 
-    torch.save(ll, f"{data_dir}/ll_{response_type}.pt")
+    torch.save(ll, f"{data_dir}/ll_{rtype}.pt")
 
 
-def vllm_log_prob(
-    response_type,
-    hf_model="meta-llama/Meta-Llama-3-8B",
-    data_dir=DATA_DIR,
+def train(
+    *,
+    hf_model="/lfs/ampere2/0/ranjanr/cs336-a5/out/sft_single_gpu/hf_model",
+    batch_size=1,
+    val_size=256,
+    lr=1e-6,
+    weight_decay=0.01,
+    beta=0.1,
 ):
-    with open(f"{data_dir}/{response_type}_templated.json") as in_f:
-        texts = json.load(in_f)
+    device = "cuda"
+    torch.set_float32_matmul_precision("medium")
 
-    lm = LLM(model=hf_model)
-    sampling_params = SamplingParams(
-        max_tokens=1,
-        prompt_logprobs=1,
+    # load data
+    all_input_ids = {}
+    all_attention_mask = {}
+    all_ref_ll = {}
+    for rtype in ["chosen", "rejected"]:
+        all_input_ids[rtype] = torch.load(
+            f"{DATA_DIR}/input_ids_{rtype}.pt", map_location="cpu"
+        )
+        all_attention_mask[rtype] = torch.load(
+            f"{DATA_DIR}/attention_mask_{rtype}.pt", map_location="cpu"
+        )
+        all_ref_ll[rtype] = torch.load(f"{DATA_DIR}/ll_{rtype}.pt", map_location="cpu")
+
+    # shuffle
+    len_data = all_input_ids["chosen"].size(0)
+    shuffle_idx = torch.randperm(len_data)
+    for rtype in ["chosen", "rejected"]:
+        all_input_ids[rtype] = all_input_ids[rtype][shuffle_idx]
+        all_attention_mask[rtype] = all_attention_mask[rtype][shuffle_idx]
+        all_ref_ll[rtype] = all_ref_ll[rtype][shuffle_idx]
+
+    # drop last
+    eff_batch_size = batch_size
+    len_drop = len_data % eff_batch_size
+    if len_drop > 0:
+        for rtype in ["chosen", "rejected"]:
+            all_input_ids[rtype] = all_input_ids[rtype][:-len_drop]
+            all_attention_mask[rtype] = all_attention_mask[rtype][:-len_drop]
+            all_ref_ll[rtype] = all_ref_ll[rtype][:-len_drop]
+    len_data = all_input_ids["chosen"].size(0)
+
+    # split
+    assert val_size % eff_batch_size == 0
+    split_input_ids = {}
+    split_attention_mask = {}
+    split_ref_ll = {}
+    for rtype in ["chosen", "rejected"]:
+        train_split, val_split = torch.split(
+            all_input_ids[rtype],
+            [len_data - val_size, val_size],
+        )
+        split_input_ids[rtype] = {"train": train_split, "val": val_split}
+
+        train_split, val_split = torch.split(
+            all_attention_mask[rtype],
+            [len_data - val_size, val_size],
+        )
+        split_attention_mask[rtype] = {"train": train_split, "val": val_split}
+
+        train_split, val_split = torch.split(
+            all_ref_ll[rtype],
+            [len_data - val_size, val_size],
+        )
+        split_ref_ll[rtype] = {"train": train_split, "val": val_split}
+
+    # model
+    model = AutoModelForCausalLM.from_pretrained(
+        hf_model,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
     )
 
-    outputs = lm.generate(texts, sampling_params)
-    breakpoint()
+    # optimizer
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    lrs = optim.lr_scheduler.OneCycleLR(
+        opt,
+        max_lr=lr,
+        total_steps=len_data // eff_batch_size,
+        pct_start=0.03,
+        anneal_strategy="cos",
+        final_div_factor=10,
+    )
+
+    # train one epoch
+    num_batches = len_data // batch_size
+    for batch_idx in tqdm(range(num_batches)):
+        model.train()
+
+        idx = torch.arange(batch_idx * batch_size, (batch_idx + 1) * batch_size)
+        input_ids = {}
+        attention_mask = {}
+        ref_ll = {}
+        for rtype in ["chosen", "rejected"]:
+            input_ids[rtype] = split_input_ids[rtype]["train"][idx]
+            input_ids[rtype] = input_ids[rtype].to(device)
+            attention_mask[rtype] = split_attention_mask[rtype]["train"][idx]
+            attention_mask[rtype] = attention_mask[rtype].to(device)
+            ref_ll[rtype] = split_ref_ll[rtype]["train"][idx]
+            ref_ll[rtype] = ref_ll[rtype].to(device)
+
+        ll = {}
+        for rtype in ["chosen", "rejected"]:
+            outputs = model(input_ids[rtype], attention_mask=attention_mask[rtype])
+            logits = outputs.logits
+            token_ll = -F.cross_entropy(
+                logits[:, :-1].transpose(1, 2),
+                input_ids[rtype][:, 1:],
+                reduction="none",
+            )
+            ll[rtype] = token_ll.sum(-1)
+
+        lm_log_ratio = ll["chosen"] - ll["rejected"]
+        ref_log_ratio = ref_ll["chosen"] - ref_ll["rejected"]
+        diff = lm_log_ratio - ref_log_ratio
+        loss = -F.logsigmoid(-beta * diff)
+        print(loss.item())
+
+        loss.backward()
+
+        opt.step()
+        lrs.step()
+        opt.zero_grad(set_to_none=True)
