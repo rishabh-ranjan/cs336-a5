@@ -4,6 +4,9 @@ from pathlib import Path
 import pkg_resources
 import random
 import time
+import multiprocessing as mp
+
+mp.set_start_method("forkserver")
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
@@ -48,12 +51,12 @@ def main(
     hf_model="meta-llama/Meta-Llama-3-8B",
     ctx_len=512,
     batch_size=2,
-    grad_acc_steps=16,
+    grad_acc_steps=2,
     lr=2e-5,
     weight_decay=0.01,
     wandb_project="sft",
-    grad_clip=1.0,
-    torch_compile=True,
+    grad_clip=None,
+    torch_compile=False,
     save_every_n_batches=8_000,
     out_dir="out/sft_multi_gpu",
     split="train",
@@ -82,7 +85,6 @@ def main(
         "cs336_alignment", f"data/sft/{split}.pt"
     )
     data = torch.load(data_file)
-    data = data.to(device)
     num_batches = (data.size(0) - 1) // ctx_len // ddp_world_size
     num_steps = num_batches // grad_acc_steps
     num_batch_tokens = batch_size * ctx_len
@@ -93,29 +95,30 @@ def main(
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     )
-    model = model.to(device)
+    # model = model.to(device)
 
+    torch.set_float32_matmul_precision("medium")
     if torch_compile:
-        torch.set_float32_matmul_precision("medium")
         model = torch.compile(model)
 
     if is_ddp:
         model = FSDP(model, device_id=ddp_local_rank)
 
-    wd_params = []
-    non_wd_params = []
-    for param in model.parameters():
-        if param.dim() >= 2:
-            wd_params.append(param)
-        else:
-            non_wd_params.append(param)
-    opt = optim.AdamW(
-        [
-            {"params": wd_params, "weight_decay": weight_decay},
-            {"params": non_wd_params, "weight_decay": 0.0},
-        ],
-        lr=lr,
-    )
+    # wd_params = []
+    # non_wd_params = []
+    # for param in model.parameters():
+    #     if param.dim() >= 2:
+    #         wd_params.append(param)
+    #     else:
+    #         non_wd_params.append(param)
+    # opt = optim.AdamW(
+    #     [
+    #         {"params": wd_params, "weight_decay": weight_decay},
+    #         {"params": non_wd_params, "weight_decay": 0.0},
+    #     ],
+    #     lr=lr,
+    # )
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     lrs = optim.lr_scheduler.OneCycleLR(
         opt,
         max_lr=lr,
@@ -140,7 +143,7 @@ def main(
         print(f"checkpointing took {toc - tic:.3f} s")
 
     for batch_idx in tqdm(range(num_batches)):
-        # if is_ddp:
+        # if is_ddp
         #     model.require_backward_grad_sync = (batch_idx + 1) % grad_acc_steps == 0
 
         global_batch_idx = batch_idx * ddp_world_size + ddp_rank
@@ -151,10 +154,9 @@ def main(
         inputs = batch[:-1].view(batch_size, ctx_len)
         labels = batch[1:].view(batch_size, ctx_len)
 
-        with model.no_sync():
-            logits = model(inputs).logits
-            loss = F.cross_entropy(logits.transpose(1, 2), labels)
-            loss.backward()
+        logits = model(inputs).logits
+        loss = F.cross_entropy(logits.transpose(1, 2), labels)
+        loss.backward()
 
         if (batch_idx + 1) % grad_acc_steps == 0:
             if is_master_process:
