@@ -111,14 +111,16 @@ def train(
     batch_size=4,
     lr=1e-6,
     weight_decay=0.01,
+    lrs="constant",
     beta=0.1,
     grad_acc_steps=2,
     opt="rmsprop",
-    torch_compile=False,
-    fsdp=False,
+    torch_compile=True,
+    fsdp=True,
     val_size=256,  # TODO
-    eval_every_n_batches=20,
+    eval_every_n_batches=10,
     wandb_project="dpo",
+    out_dir="out/dpo_fsdp",
 ):
     torch.set_float32_matmul_precision("medium")
 
@@ -149,7 +151,7 @@ def train(
 
     # shuffle
     len_data = all_input_ids["chosen"].size(0)
-    shuffle_idx = torch.randperm(len_data)
+    shuffle_idx = torch.randperm(len_data, generator=torch.Generator().manual_seed(42))
     for rtype in ["chosen", "rejected"]:
         all_input_ids[rtype] = all_input_ids[rtype][shuffle_idx]
         all_attention_mask[rtype] = all_attention_mask[rtype][shuffle_idx]
@@ -197,7 +199,7 @@ def train(
     )
 
     if fsdp:
-        model = FSDP(model, device_id=device)
+        model = FSDP(model, device_id=device, use_orig_params=True)
     else:
         model = model.to(device)
 
@@ -211,16 +213,38 @@ def train(
         opt = optim.RMSprop(model.parameters(), lr=lr, weight_decay=weight_decay)
     elif opt == "sgd":
         opt = optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
-    lrs = optim.lr_scheduler.OneCycleLR(
-        opt,
-        max_lr=lr,
-        total_steps=len_data // eff_batch_size,
-        pct_start=0.03,
-        anneal_strategy="cos",
-        final_div_factor=10,
-    )
+
+    if lrs == "onecycle":
+        lrs = optim.lr_scheduler.OneCycleLR(
+            opt,
+            max_lr=lr,
+            total_steps=len_data // eff_batch_size,
+            pct_start=0.03,
+            anneal_strategy="cos",
+            final_div_factor=10,
+        )
+    elif lrs == "constant":
+        lrs = optim.lr_scheduler.LambdaLR(
+            opt,
+            lr_lambda=lambda epoch: 1.0,
+        )
+
+    def checkpoint():
+        tic = time.time()
+        try:
+            Path(f"{out_dir}/model.pt").rename(f"{out_dir}/old_model.pt")
+            Path(f"{out_dir}/opt.pt").rename(f"{out_dir}/old_opt.pt")
+            Path(f"{out_dir}/lrs.pt").rename(f"{out_dir}/old_lrs.pt")
+        except FileNotFoundError:
+            pass
+        torch.save(model.state_dict(), f"{out_dir}/model.pt")
+        torch.save(opt.state_dict(), f"{out_dir}/opt.pt")
+        torch.save(lrs.state_dict(), f"{out_dir}/lrs.pt")
+        toc = time.time()
+        print(f"checkpointing took {toc - tic:.3f} s")
 
     # train one epoch
+    best_val_acc = 0
     num_batches = len_data // (batch_size * world_size)
     num_val_batches = val_size // (batch_size * world_size)
     for global_batch_idx in tqdm(range(num_batches)):
@@ -336,6 +360,9 @@ def train(
                         acc = acc.item() / (batch_size * world_size)
                         if wandb_project:
                             wandb.log({"val_acc": acc}, step=global_batch_idx)
+                        if acc > best_val_acc:
+                            best_val_acc = acc
+                            checkpoint()
 
     if fsdp:
         destroy_process_group()
