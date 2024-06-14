@@ -5,11 +5,13 @@ import os
 import torch
 from torch import nn, optim
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.distributed import init_process_group, destroy_process_group
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from vllm import LLM, SamplingParams
 from tqdm.auto import tqdm
+import wandb
 
 from . import templates
 
@@ -106,8 +108,7 @@ def infer(
 def train(
     *,
     hf_model="/lfs/ampere2/0/ranjanr/cs336-a5/out/sft_single_gpu/hf_model",
-    batch_size=1,
-    val_size=256,
+    batch_size=4,
     lr=1e-6,
     weight_decay=0.01,
     beta=0.1,
@@ -115,6 +116,9 @@ def train(
     opt="rmsprop",
     torch_compile=False,
     fsdp=False,
+    val_size=256,  # TODO
+    eval_every_n_batches=20,
+    wandb_project="dpo",
 ):
     torch.set_float32_matmul_precision("medium")
 
@@ -125,6 +129,10 @@ def train(
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     device = f"cuda:{local_rank}"
+
+    if rank == 0:
+        if wandb_project:
+            wandb.init(project=wandb_project, config=locals())
 
     # load data
     all_input_ids = {}
@@ -148,7 +156,7 @@ def train(
         all_ref_ll[rtype] = all_ref_ll[rtype][shuffle_idx]
 
     # drop last
-    eff_batch_size = batch_size * grad_acc_steps
+    eff_batch_size = batch_size * grad_acc_steps * world_size
     len_drop = len_data % eff_batch_size
     if len_drop > 0:
         for rtype in ["chosen", "rejected"]:
@@ -213,13 +221,13 @@ def train(
     )
 
     # train one epoch
-    num_batches = len_data // batch_size
-    for batch_idx in tqdm(range(num_batches)):
+    num_batches = len_data // (batch_size * world_size)
+    num_val_batches = val_size // (batch_size * world_size)
+    for global_batch_idx in tqdm(range(num_batches)):
         model.train()
 
-        global_batch_idx = batch_idx * world_size + rank
-        global_batch_size = batch_size * world_size
-        begin_idx = global_batch_idx * global_batch_size
+        batch_idx = global_batch_idx * world_size + rank
+        begin_idx = batch_idx * batch_size
         end_idx = begin_idx + batch_size
         idx = torch.arange(begin_idx, end_idx)
         input_ids = {}
@@ -258,17 +266,76 @@ def train(
         ref_log_ratio = ref_log_ratio.to(device)
         diff = lm_log_ratio - ref_log_ratio
         loss = -F.logsigmoid(-beta * diff)
-        loss = loss / grad_acc_steps
+        loss = loss.sum() / eff_batch_size
         # if rank == 0:
         #     print(loss.item())
 
         loss.backward()
 
-        if (batch_idx + 1) % grad_acc_steps == 0:
+        if (global_batch_idx + 1) % grad_acc_steps == 0:
+            if rank == 0:
+                wandb.log(
+                    {
+                        "epochs": (global_batch_idx + 1) / num_batches,
+                        "lr": lrs.get_last_lr()[0],
+                        "loss": loss.item(),
+                    },
+                    step=global_batch_idx,
+                )
+
             torch.cuda.empty_cache()
             opt.step()
             lrs.step()
             opt.zero_grad(set_to_none=True)
+
+        if (global_batch_idx + 1) % eval_every_n_batches == 0:
+            model.eval()
+            with torch.no_grad():
+                for val_global_batch_idx in range(num_val_batches):
+                    batch_idx = val_global_batch_idx * world_size + rank
+                    begin_idx = batch_idx * batch_size
+                    end_idx = begin_idx + batch_size
+                    idx = torch.arange(begin_idx, end_idx)
+                    input_ids = {}
+                    attention_mask = {}
+                    ref_ll = {}
+                    for rtype in ["chosen", "rejected"]:
+                        input_ids[rtype] = split_input_ids[rtype]["val"][idx]
+                        input_ids[rtype] = input_ids[rtype]
+                        attention_mask[rtype] = split_attention_mask[rtype]["val"][idx]
+                        attention_mask[rtype] = attention_mask[rtype]
+                        ref_ll[rtype] = split_ref_ll[rtype]["val"][idx]
+                        ref_ll[rtype] = ref_ll[rtype]
+
+                    input_ids = torch.cat([input_ids["chosen"], input_ids["rejected"]])
+                    input_ids = input_ids.to(device)
+                    attention_mask = torch.cat(
+                        [attention_mask["chosen"], attention_mask["rejected"]]
+                    )
+                    attention_mask = attention_mask.to(device)
+                    ref_ll = torch.cat([ref_ll["chosen"], ref_ll["rejected"]])
+                    ref_ll = ref_ll.to(device)
+
+                    torch.cuda.empty_cache()
+                    logits = model(
+                        input_ids,
+                        attention_mask=attention_mask,
+                    ).logits
+                    token_ll = -F.cross_entropy(
+                        logits[:, :-1].transpose(1, 2),
+                        input_ids[:, 1:],
+                        reduction="none",
+                    )
+                    ll = token_ll.sum(-1)
+
+                    lm_log_ratio = ll[:batch_size] - ll[batch_size:]
+                    acc = lm_log_ratio > 0
+                    acc = acc.sum()
+                    dist.reduce(acc, 0)
+                    if rank == 0:
+                        acc = acc.item() / (batch_size * world_size)
+                        if wandb_project:
+                            wandb.log({"val_acc": acc}, step=global_batch_idx)
 
     if fsdp:
         destroy_process_group()
