@@ -111,16 +111,17 @@ def train(
     *,
     hf_model="/lfs/ampere2/0/ranjanr/cs336-a5/out/sft_single_gpu/hf_model",
     batch_size=4,
-    lr=1e-6,
+    # lr=1e-6,
+    lr=1e-5,
     weight_decay=0.01,
     lrs="constant",
     beta=0.1,
     grad_acc_steps=2,
     opt="rmsprop",
-    torch_compile=True,
+    torch_compile=False,
     fsdp=True,
-    val_size=256,  # TODO
-    eval_every_n_batches=20,
+    val_size=128,  # TODO
+    eval_every_n_batches=10,
     wandb_project="dpo",
     out_dir="out/dpo_fsdp",
 ):
@@ -151,22 +152,22 @@ def train(
         )
         all_ref_ll[rtype] = torch.load(f"{DATA_DIR}/ll_{rtype}.pt", map_location="cpu")
 
-    # shuffle
-    len_data = all_input_ids["chosen"].size(0)
-    shuffle_idx = torch.randperm(len_data, generator=torch.Generator().manual_seed(42))
-    for rtype in ["chosen", "rejected"]:
-        all_input_ids[rtype] = all_input_ids[rtype][shuffle_idx]
-        all_attention_mask[rtype] = all_attention_mask[rtype][shuffle_idx]
-        all_ref_ll[rtype] = all_ref_ll[rtype][shuffle_idx]
+    # # shuffle
+    # len_data = all_input_ids["chosen"].size(0)
+    # shuffle_idx = torch.randperm(len_data, generator=torch.Generator().manual_seed(42))
+    # for rtype in ["chosen", "rejected"]:
+    #     all_input_ids[rtype] = all_input_ids[rtype][shuffle_idx]
+    #     all_attention_mask[rtype] = all_attention_mask[rtype][shuffle_idx]
+    #     all_ref_ll[rtype] = all_ref_ll[rtype][shuffle_idx]
 
     # drop last
     eff_batch_size = batch_size * grad_acc_steps * world_size
-    len_drop = len_data % eff_batch_size
-    if len_drop > 0:
-        for rtype in ["chosen", "rejected"]:
-            all_input_ids[rtype] = all_input_ids[rtype][:-len_drop]
-            all_attention_mask[rtype] = all_attention_mask[rtype][:-len_drop]
-            all_ref_ll[rtype] = all_ref_ll[rtype][:-len_drop]
+    # len_drop = len_data % eff_batch_size
+    # if len_drop > 0:
+    #     for rtype in ["chosen", "rejected"]:
+    #         all_input_ids[rtype] = all_input_ids[rtype][:-len_drop]
+    #         all_attention_mask[rtype] = all_attention_mask[rtype][:-len_drop]
+    #         all_ref_ll[rtype] = all_ref_ll[rtype][:-len_drop]
     len_data = all_input_ids["chosen"].size(0)
 
     # split
@@ -261,11 +262,8 @@ def train(
         ref_ll = {}
         for rtype in ["chosen", "rejected"]:
             input_ids[rtype] = split_input_ids[rtype]["train"][idx]
-            input_ids[rtype] = input_ids[rtype]
             attention_mask[rtype] = split_attention_mask[rtype]["train"][idx]
-            attention_mask[rtype] = attention_mask[rtype]
             ref_ll[rtype] = split_ref_ll[rtype]["train"][idx]
-            ref_ll[rtype] = ref_ll[rtype]
 
         input_ids = torch.cat([input_ids["chosen"], input_ids["rejected"]])
         input_ids = input_ids.to(device)
@@ -274,7 +272,7 @@ def train(
         )
         attention_mask = attention_mask.to(device)
         ref_ll = torch.cat([ref_ll["chosen"], ref_ll["rejected"]])
-        rel_ll = ref_ll.to(device)
+        ref_ll = ref_ll.to(device)
 
         logits = model(
             input_ids,
@@ -289,7 +287,6 @@ def train(
 
         lm_log_ratio = ll[:batch_size] - ll[batch_size:]
         ref_log_ratio = ref_ll[:batch_size] - ref_ll[batch_size:]
-        ref_log_ratio = ref_log_ratio.to(device)
         diff = lm_log_ratio - ref_log_ratio
         loss = -F.logsigmoid(beta * diff)
         loss = loss.sum() / eff_batch_size
@@ -317,6 +314,7 @@ def train(
         if (global_batch_idx + 1) % eval_every_n_batches == 0:
             model.eval()
             with torch.no_grad():
+                acc = 0
                 for val_global_batch_idx in range(num_val_batches):
                     batch_idx = val_global_batch_idx * world_size + rank
                     begin_idx = batch_idx * batch_size
@@ -355,16 +353,18 @@ def train(
                     ll = token_ll.sum(-1)
 
                     lm_log_ratio = ll[:batch_size] - ll[batch_size:]
-                    acc = lm_log_ratio > 0
-                    acc = acc.sum()
-                    dist.reduce(acc, 0)
-                    if rank == 0:
-                        acc = acc.item() / (batch_size * world_size)
-                        if wandb_project:
-                            wandb.log({"val_acc": acc}, step=global_batch_idx)
-                        if acc > best_val_acc:
-                            best_val_acc = acc
-                            checkpoint()
+                    acc += (lm_log_ratio > 0).sum()
+
+                dist.reduce(acc, 0)
+                if rank == 0:
+                    acc = acc.item() / val_size
+                    if wandb_project:
+                        print(acc)
+                        wandb.log({"val_acc": acc}, step=global_batch_idx)
+                    if acc > best_val_acc:
+                        best_val_acc = acc
+                        # TODO: uncomment
+                        # checkpoint()
 
     if fsdp:
         destroy_process_group()
