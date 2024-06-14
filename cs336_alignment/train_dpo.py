@@ -1,9 +1,12 @@
 import pkg_resources
 import json
+import os
 
 import torch
 from torch import nn, optim
 import torch.nn.functional as F
+from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from vllm import LLM, SamplingParams
 from tqdm.auto import tqdm
@@ -108,9 +111,20 @@ def train(
     lr=1e-6,
     weight_decay=0.01,
     beta=0.1,
+    grad_acc_steps=2,
+    opt="rmsprop",
+    torch_compile=False,
+    fsdp=False,
 ):
-    device = "cuda"
     torch.set_float32_matmul_precision("medium")
+
+    if fsdp:
+        init_process_group(backend="nccl")
+
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    device = f"cuda:{local_rank}"
 
     # load data
     all_input_ids = {}
@@ -134,7 +148,7 @@ def train(
         all_ref_ll[rtype] = all_ref_ll[rtype][shuffle_idx]
 
     # drop last
-    eff_batch_size = batch_size
+    eff_batch_size = batch_size * grad_acc_steps
     len_drop = len_data % eff_batch_size
     if len_drop > 0:
         for rtype in ["chosen", "rejected"]:
@@ -174,8 +188,21 @@ def train(
         attn_implementation="flash_attention_2",
     )
 
+    if fsdp:
+        model = FSDP(model, device_id=device)
+    else:
+        model = model.to(device)
+
+    if torch_compile:
+        model = torch.compile(model)
+
     # optimizer
-    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    if opt == "adamw":
+        opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif opt == "rmsprop":
+        opt = optim.RMSprop(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif opt == "sgd":
+        opt = optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
     lrs = optim.lr_scheduler.OneCycleLR(
         opt,
         max_lr=lr,
@@ -190,37 +217,58 @@ def train(
     for batch_idx in tqdm(range(num_batches)):
         model.train()
 
-        idx = torch.arange(batch_idx * batch_size, (batch_idx + 1) * batch_size)
+        global_batch_idx = batch_idx * world_size + rank
+        global_batch_size = batch_size * world_size
+        begin_idx = global_batch_idx * global_batch_size
+        end_idx = begin_idx + batch_size
+        idx = torch.arange(begin_idx, end_idx)
         input_ids = {}
         attention_mask = {}
         ref_ll = {}
         for rtype in ["chosen", "rejected"]:
             input_ids[rtype] = split_input_ids[rtype]["train"][idx]
-            input_ids[rtype] = input_ids[rtype].to(device)
+            input_ids[rtype] = input_ids[rtype]
             attention_mask[rtype] = split_attention_mask[rtype]["train"][idx]
-            attention_mask[rtype] = attention_mask[rtype].to(device)
+            attention_mask[rtype] = attention_mask[rtype]
             ref_ll[rtype] = split_ref_ll[rtype]["train"][idx]
-            ref_ll[rtype] = ref_ll[rtype].to(device)
+            ref_ll[rtype] = ref_ll[rtype]
 
-        ll = {}
-        for rtype in ["chosen", "rejected"]:
-            outputs = model(input_ids[rtype], attention_mask=attention_mask[rtype])
-            logits = outputs.logits
-            token_ll = -F.cross_entropy(
-                logits[:, :-1].transpose(1, 2),
-                input_ids[rtype][:, 1:],
-                reduction="none",
-            )
-            ll[rtype] = token_ll.sum(-1)
+        input_ids = torch.cat([input_ids["chosen"], input_ids["rejected"]])
+        input_ids = input_ids.to(device)
+        attention_mask = torch.cat(
+            [attention_mask["chosen"], attention_mask["rejected"]]
+        )
+        attention_mask = attention_mask.to(device)
+        ref_ll = torch.cat([ref_ll["chosen"], ref_ll["rejected"]])
+        rel_ll = ref_ll.to(device)
 
-        lm_log_ratio = ll["chosen"] - ll["rejected"]
-        ref_log_ratio = ref_ll["chosen"] - ref_ll["rejected"]
+        logits = model(
+            input_ids,
+            attention_mask=attention_mask,
+        ).logits
+        token_ll = -F.cross_entropy(
+            logits[:, :-1].transpose(1, 2),
+            input_ids[:, 1:],
+            reduction="none",
+        )
+        ll = token_ll.sum(-1)
+
+        lm_log_ratio = ll[:batch_size] - ll[batch_size:]
+        ref_log_ratio = ref_ll[:batch_size] - ref_ll[batch_size:]
+        ref_log_ratio = ref_log_ratio.to(device)
         diff = lm_log_ratio - ref_log_ratio
         loss = -F.logsigmoid(-beta * diff)
-        print(loss.item())
+        loss = loss / grad_acc_steps
+        # if rank == 0:
+        #     print(loss.item())
 
         loss.backward()
 
-        opt.step()
-        lrs.step()
-        opt.zero_grad(set_to_none=True)
+        if (batch_idx + 1) % grad_acc_steps == 0:
+            torch.cuda.empty_cache()
+            opt.step()
+            lrs.step()
+            opt.zero_grad(set_to_none=True)
+
+    if fsdp:
+        destroy_process_group()
