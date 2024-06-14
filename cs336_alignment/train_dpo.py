@@ -114,14 +114,14 @@ def train(
     # lr=1e-6,
     lr=1e-5,
     weight_decay=0.01,
-    lrs="constant",
+    lrs="onecycle",
     beta=0.1,
     grad_acc_steps=2,
     opt="rmsprop",
     torch_compile=False,
     fsdp=True,
-    val_size=128,  # TODO
-    eval_every_n_batches=10,
+    val_size=256,  # TODO
+    eval_every_n_batches=20,
     wandb_project="dpo",
     out_dir="out/dpo_fsdp",
 ):
@@ -241,8 +241,8 @@ def train(
         except FileNotFoundError:
             pass
         torch.save(model.state_dict(), f"{out_dir}/model.pt")
-        torch.save(opt.state_dict(), f"{out_dir}/opt.pt")
-        torch.save(lrs.state_dict(), f"{out_dir}/lrs.pt")
+        # torch.save(opt.state_dict(), f"{out_dir}/opt.pt")
+        # torch.save(lrs.state_dict(), f"{out_dir}/lrs.pt")
         toc = time.time()
         print(f"checkpointing took {toc - tic:.3f} s")
 
@@ -306,7 +306,8 @@ def train(
                     step=global_batch_idx,
                 )
 
-            torch.cuda.empty_cache()
+            if global_batch_idx == 0:
+                torch.cuda.empty_cache()
             opt.step()
             lrs.step()
             opt.zero_grad(set_to_none=True)
@@ -361,10 +362,9 @@ def train(
                     if wandb_project:
                         print(acc)
                         wandb.log({"val_acc": acc}, step=global_batch_idx)
-                    if acc > best_val_acc:
+                    if acc >= best_val_acc:
                         best_val_acc = acc
-                        # TODO: uncomment
-                        # checkpoint()
+                        checkpoint()
 
     if fsdp:
         destroy_process_group()
