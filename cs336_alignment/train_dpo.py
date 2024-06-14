@@ -265,7 +265,7 @@ def train(
         ref_log_ratio = ref_ll[:batch_size] - ref_ll[batch_size:]
         ref_log_ratio = ref_log_ratio.to(device)
         diff = lm_log_ratio - ref_log_ratio
-        loss = -F.logsigmoid(-beta * diff)
+        loss = -F.logsigmoid(beta * diff)
         loss = loss.sum() / eff_batch_size
         # if rank == 0:
         #     print(loss.item())
