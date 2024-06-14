@@ -111,19 +111,19 @@ def train(
     *,
     hf_model="/lfs/ampere2/0/ranjanr/cs336-a5/out/sft_single_gpu/hf_model",
     batch_size=4,
-    # lr=1e-6,
-    lr=1e-5,
+    lr=1e-6,
     weight_decay=0.01,
     lrs="onecycle",
     beta=0.1,
     grad_acc_steps=2,
     opt="rmsprop",
-    torch_compile=False,
+    torch_compile=True,
     fsdp=True,
     val_size=256,  # TODO
     eval_every_n_batches=20,
     wandb_project="dpo",
     out_dir="out/dpo_fsdp",
+    clip_grad_norm=1.0,
 ):
     torch.set_float32_matmul_precision("medium")
 
@@ -294,6 +294,9 @@ def train(
         #     print(loss.item())
 
         loss.backward()
+
+        if clip_grad_norm:
+            model.clip_grad_norm_(clip_grad_norm)
 
         if (global_batch_idx + 1) % grad_acc_steps == 0:
             if rank == 0:

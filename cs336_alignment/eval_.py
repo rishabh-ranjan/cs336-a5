@@ -73,7 +73,7 @@ def get_responses(prompts, hf_model="meta-llama/Meta-Llama-3-8B"):
     sampling_params = SamplingParams(
         temperature=0.0,
         top_p=1.0,
-        max_tokens=1024,
+        max_tokens=512,
         stop=["# Query:"],
     )
     llm = LLM(model=hf_model)
