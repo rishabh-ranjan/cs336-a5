@@ -1,6 +1,8 @@
 import pkg_resources
 import json
 import os
+import time
+from pathlib import Path
 
 import torch
 from torch import nn, optim
@@ -118,7 +120,7 @@ def train(
     torch_compile=True,
     fsdp=True,
     val_size=256,  # TODO
-    eval_every_n_batches=10,
+    eval_every_n_batches=20,
     wandb_project="dpo",
     out_dir="out/dpo_fsdp",
 ):
